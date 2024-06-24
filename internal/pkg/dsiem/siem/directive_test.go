@@ -29,7 +29,7 @@ import (
 func TestInitDirective(t *testing.T) {
 
 	allBacklogsMu.Lock()
-	allBacklogs = []backlogs{}
+	allBacklogs = []*backlogs{}
 	allBacklogsMu.Unlock()
 
 	fmt.Println("Starting TestInitDirective.")

@@ -31,12 +31,11 @@ import (
 
 	"sync"
 	"time"
-
-	"github.com/jonhoo/drwmutex"
 )
 
 type backlogs struct {
-	drwmutex.DRWMutex
+	// drwmutex.DRWMutex
+	mut  sync.RWMutex
 	id   int
 	bl   map[string]*backLog
 	bpCh chan bool
@@ -46,7 +45,7 @@ var (
 	// protects allBacklogs
 	allBacklogsMu sync.RWMutex
 
-	allBacklogs []backlogs
+	allBacklogs []*backlogs
 	fWriter     fs.FileWriter
 )
 
@@ -131,13 +130,13 @@ func CountBackLogs() (sum int, activeDirectives int, ttlDirectives int) {
 
 	ttlDirectives = len(allBacklogs)
 	for i := range allBacklogs {
-		l := allBacklogs[i].RLock()
+		allBacklogs[i].mut.RLock()
 		nBlogs := len(allBacklogs[i].bl)
 		sum += nBlogs
 		if nBlogs > 0 {
 			activeDirectives++
 		}
-		l.Unlock()
+		allBacklogs[i].mut.RUnlock()
 	}
 	return
 }
@@ -195,7 +194,7 @@ mainLoop:
 		// found := false
 		// zero means false
 		var found uint32
-		l := blogs.RLock() // to prevent concurrent r/w with delete()
+		blogs.mut.RLock() // to prevent concurrent r/w with delete()
 
 		wg := &sync.WaitGroup{}
 
@@ -231,7 +230,7 @@ mainLoop:
 			}(k)
 		}
 		wg.Wait()
-		l.Unlock()
+		blogs.mut.RUnlock()
 
 		if found > 0 {
 			if apm.Enabled() && tx != nil {
@@ -252,7 +251,7 @@ mainLoop:
 
 		// compare the event against all backlogs event ID to prevent duplicates
 		// due to concurrency
-		blogs.Lock()
+		blogs.mut.Lock()
 		for _, v := range blogs.bl {
 			for _, y := range v.Directive.Rules {
 				for _, j := range y.Events {
@@ -263,16 +262,16 @@ mainLoop:
 							tx.Result("Event already used in backlog" + v.ID)
 							tx.End()
 						}
-						blogs.Unlock()
+						blogs.mut.Unlock()
 						continue mainLoop // back to chan loop
 					}
 				}
 			}
 		}
-		blogs.Unlock()
+		blogs.mut.Unlock()
 
 		// lock from here also to prevent duplicates
-		blogs.Lock()
+		blogs.mut.Lock()
 		b, err := createNewBackLog(d, evt)
 		if err != nil {
 			log.Warn(log.M{Msg: "Fail to create new backlog", DId: d.ID, CId: evt.ConnID})
@@ -280,12 +279,12 @@ mainLoop:
 				tx.Result("Fail to create new backlog")
 				tx.End()
 			}
-			blogs.Unlock()
+			blogs.mut.Unlock()
 			continue mainLoop
 		}
 		blogs.bl[b.ID] = b
 		blogs.bl[b.ID].bLogs = blogs
-		blogs.Unlock()
+		blogs.mut.Unlock()
 		if apm.Enabled() && tx != nil {
 			tx.Result("Event created a new backlog")
 			tx.End()
@@ -297,13 +296,13 @@ mainLoop:
 func (blogs *backlogs) delete(b *backLog) {
 	go func() {
 		// first prevent another blogs.delete to enter here
-		blogs.Lock()
+		blogs.mut.Lock()
 		b.Lock()
 		if b.deleted {
 			// already in the closing process
 			log.Debug(log.M{Msg: "backlog is already in the process of being deleted"})
 			b.Unlock()
-			blogs.Unlock()
+			blogs.mut.Unlock()
 			return
 		}
 		log.Info(log.M{Msg: "backlog manager removing backlog in < 10s", DId: b.Directive.ID, BId: b.ID})
@@ -312,19 +311,19 @@ func (blogs *backlogs) delete(b *backLog) {
 		// prevent further event write by manager, and stop backlog ticker
 		close(b.chDone)
 		b.Unlock()
-		blogs.Unlock()
+		blogs.mut.Unlock()
 		time.Sleep(3 * time.Second)
 		// signal backlog worker to exit
 		log.Debug(log.M{Msg: "backlog manager closing data channel", DId: b.Directive.ID, BId: b.ID})
 		close(b.chData)
 		time.Sleep(3 * time.Second)
 		log.Debug(log.M{Msg: "backlog manager deleting backlog from map", DId: b.Directive.ID, BId: b.ID})
-		blogs.Lock()
+		blogs.mut.Lock()
 		blogs.bl[b.ID].Lock()
 		blogs.bl[b.ID].bLogs = nil
 		blogs.bl[b.ID].Unlock()
 		delete(blogs.bl, b.ID)
-		blogs.Unlock()
+		blogs.mut.Unlock()
 		ch := alarm.RemovalChannel()
 		ch <- b.ID
 	}()

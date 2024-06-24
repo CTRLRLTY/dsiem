@@ -22,6 +22,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,8 +30,6 @@ import (
 	"github.com/defenxor/dsiem/internal/pkg/shared/apm"
 	log "github.com/defenxor/dsiem/internal/pkg/shared/logger"
 	"github.com/defenxor/dsiem/internal/pkg/shared/test"
-
-	"github.com/jonhoo/drwmutex"
 )
 
 var testDir string
@@ -50,7 +49,7 @@ func TestBacklogMgr(t *testing.T) {
 	fmt.Println("Starting TestBackLogMgr.")
 
 	allBacklogsMu.Lock()
-	allBacklogs = []backlogs{}
+	allBacklogs = []*backlogs{}
 	allBacklogsMu.Unlock()
 
 	setTestDir(t)
@@ -107,13 +106,11 @@ func TestBacklogMgr(t *testing.T) {
 	ch := make(chan event.NormalizedEvent)
 	ch2 := make(chan event.NormalizedEvent)
 
-	blogs.DRWMutex = drwmutex.New()
+	// blogs.DRWMutex = drwmutex.New()
 	blogs.id = 1
 	blogs.bpCh = make(chan bool)
 	blogs.bl = make(map[string]*backLog) // have to do it here before the append
-
-	allBacklogs = append(allBacklogs, blogs)
-
+	allBacklogs = append(allBacklogs, &blogs)
 	bpChOutput := make(chan bool)
 	go func() {
 		for {
@@ -302,7 +299,7 @@ func TestBacklogManagerCustomData(t *testing.T) {
 	waitTime := 100 * time.Millisecond
 	fmt.Println("Starting TestBackLogMgr.")
 	allBacklogsMu.Lock()
-	allBacklogs = make([]backlogs, 0)
+	allBacklogs = make([]*backlogs, 0)
 	allBacklogsMu.Unlock()
 	setTestDir(t)
 
@@ -336,10 +333,11 @@ func TestBacklogManagerCustomData(t *testing.T) {
 	}
 
 	blogs := &backlogs{
-		DRWMutex: drwmutex.New(),
-		id:       1,
-		bpCh:     make(chan bool),
-		bl:       make(map[string]*backLog),
+		// DRWMutex: drwmutex.New(),
+		mut:  sync.RWMutex{},
+		id:   1,
+		bpCh: make(chan bool),
+		bl:   make(map[string]*backLog),
 	}
 
 	if err = InitBackLogManager(tmpLog, nil, 4); err != nil {
@@ -370,17 +368,17 @@ func TestBacklogManagerCustomData(t *testing.T) {
 	time.Sleep(waitTime)
 
 	var testBl *backLog
-	blogs.Lock()
+	blogs.mut.Lock()
 	if len(blogs.bl) != 1 {
 		t.Fatalf("expected 1 backlog, but got %d", len(blogs.bl))
-		blogs.Unlock()
+		blogs.mut.Unlock()
 	}
 
 	for _, v := range blogs.bl {
 		testBl = v
 		break
 	}
-	blogs.Unlock()
+	blogs.mut.Unlock()
 
 	testBl.Lock()
 	if testBl.CurrentStage != 2 {
@@ -442,9 +440,9 @@ func TestBacklogManagerCustomData(t *testing.T) {
 
 	// expected 2 backlogs now
 	var testBl2 *backLog
-	blogs.Lock()
+	blogs.mut.Lock()
 	if len(blogs.bl) != 2 {
-		blogs.Unlock()
+		blogs.mut.Unlock()
 		t.Fatalf("expected 2 backlog, but got %d", len(blogs.bl))
 
 	}
@@ -457,7 +455,7 @@ func TestBacklogManagerCustomData(t *testing.T) {
 		testBl2 = v
 		break
 	}
-	blogs.Unlock()
+	blogs.mut.Unlock()
 
 	testBl2.Lock()
 	if testBl2.CurrentStage != 2 {
@@ -511,9 +509,9 @@ func TestBacklogManagerCustomData(t *testing.T) {
 	time.Sleep(waitTime)
 
 	var testBl3 *backLog
-	blogs.Lock()
+	blogs.mut.Lock()
 	if len(blogs.bl) != 3 {
-		blogs.Unlock()
+		blogs.mut.Unlock()
 		t.Fatalf("expected 3 backlog, but got %d", len(blogs.bl))
 	}
 
@@ -525,7 +523,7 @@ func TestBacklogManagerCustomData(t *testing.T) {
 		testBl3 = blog
 		break
 	}
-	blogs.Unlock()
+	blogs.mut.Unlock()
 
 	if testBl3 == nil {
 		t.Fatal("expected third backlog to exist")

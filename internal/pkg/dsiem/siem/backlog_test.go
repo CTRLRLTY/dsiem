@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,7 +31,6 @@ import (
 	"github.com/defenxor/dsiem/internal/pkg/dsiem/event"
 	"github.com/defenxor/dsiem/internal/pkg/shared/apm"
 	log "github.com/defenxor/dsiem/internal/pkg/shared/logger"
-	"github.com/jonhoo/drwmutex"
 )
 
 var (
@@ -118,7 +118,8 @@ func TestBackLog(t *testing.T) {
 	}
 	bLogs := backlogs{}
 	bLogs.bpCh = make(chan bool)
-	bLogs.DRWMutex = drwmutex.New()
+	// bLogs.DRWMutex = drwmutex.New()
+	bLogs.mut = sync.RWMutex{}
 	bLogs.bl = make(map[string]*backLog)
 	bLogs.bl[b.ID] = b
 	// bLogs.bl[b.ID].DRWMutex = drwmutex.New()
