@@ -52,7 +52,7 @@ type Directive struct {
 	Kingdom              string                `json:"kingdom"`
 	Category             string                `json:"category"`
 	Rules                []rule.DirectiveRule  `json:"rules"`
-	StickyDiffs          []rule.StickyDiffData `json:"-"`
+	StickyDiffs          []rule.StickyDiffData `json:"sticky_differents"`
 }
 
 // Directives group directive together
@@ -84,9 +84,9 @@ func InitDirectives(confDir string, ch <-chan event.NormalizedEvent, minAlarmLif
 		blogs := backlogs{}
 		// blogs.DRWMutex = drwmutex.New()
 		blogs.mut = sync.RWMutex{}
-		blogs.id = i
+		blogs.Id = i
 		blogs.bpCh = make(chan bool)
-		blogs.bl = make(map[string]*backLog) // have to do it here before the append
+		blogs.blogs = make(map[string]*backLog) // have to do it here before the append
 		allBacklogsMu.Lock()
 		allBacklogs = append(allBacklogs, &blogs)
 		allBacklogsMu.Unlock()

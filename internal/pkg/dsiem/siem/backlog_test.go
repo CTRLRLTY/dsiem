@@ -59,7 +59,7 @@ func initAsset(t *testing.T) {
 	if assetInitialized {
 		return
 	}
-	err := asset.Init(path.Join(testDir, "internal", "pkg", "dsiem", "asset", "fixtures", "asset1"))
+	err := asset.Init(path.Join(testDirPath, "internal", "pkg", "dsiem", "asset", "fixtures", "asset1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestBackLog(t *testing.T) {
 	fmt.Println("Starting TestBackLog.")
 
 	setTestDir(t)
-	t.Logf("Using base dir %s", testDir)
+	t.Logf("Using base dir %s", testDirPath)
 
 	if !log.TestMode {
 		t.Logf("Enabling log test mode")
@@ -82,7 +82,7 @@ func TestBackLog(t *testing.T) {
 	tmpLog := path.Join(os.TempDir(), "siem_alarm_events.log")
 	fWriter.Init(tmpLog, 10)
 
-	fDir := path.Join(testDir, "internal", "pkg", "dsiem", "siem", "fixtures")
+	fDir := path.Join(testDirPath, "internal", "pkg", "dsiem", "siem", "fixtures")
 
 	// use directive that expires fast and has only 3 stages
 	dirs, _, err := LoadDirectivesFromFile(path.Join(fDir, "directive4"), directiveFileGlob, false)
@@ -120,8 +120,8 @@ func TestBackLog(t *testing.T) {
 	bLogs.bpCh = make(chan bool)
 	// bLogs.DRWMutex = drwmutex.New()
 	bLogs.mut = sync.RWMutex{}
-	bLogs.bl = make(map[string]*backLog)
-	bLogs.bl[b.ID] = b
+	bLogs.blogs = make(map[string]*backLog)
+	bLogs.blogs[b.ID] = b
 	// bLogs.bl[b.ID].DRWMutex = drwmutex.New()
 	b.bLogs = &bLogs
 

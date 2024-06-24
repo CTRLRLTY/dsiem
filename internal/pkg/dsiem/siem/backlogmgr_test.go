@@ -19,6 +19,7 @@ package siem
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"path"
 	"strconv"
 	"strings"
@@ -32,15 +33,38 @@ import (
 	"github.com/defenxor/dsiem/internal/pkg/shared/test"
 )
 
-var testDir string
+var testDirPath string
 
 func setTestDir(t *testing.T) {
-	if testDir == "" {
+	if testDirPath == "" {
 		d, err := test.DirEnv(true)
 		if err != nil {
 			t.Fatal(err)
 		}
-		testDir = d
+		testDirPath = d
+	}
+}
+
+func verifyEventOutput(t *testing.T, e event.NormalizedEvent, ch chan event.NormalizedEvent, expected string) {
+	out := log.CaptureZapOutput(func() {
+		ch <- e
+		time.Sleep(time.Second * 1)
+	})
+	t.Log("out: ", out)
+	if !strings.Contains(out, expected) {
+		t.Fatalf("Cannot find '%s' in output: %s", expected, out)
+	} else {
+		fmt.Println("OK")
+	}
+}
+
+func verifyFuncOutput(t *testing.T, f func(), expected string, expectMatch bool) {
+	out := log.CaptureZapOutput(f)
+	t.Log("out: ", out)
+	if !strings.Contains(out, expected) == expectMatch {
+		t.Fatalf("Cannot find '%s' in output: %s", expected, out)
+	} else {
+		fmt.Println("OK")
 	}
 }
 
@@ -53,14 +77,14 @@ func TestBacklogMgr(t *testing.T) {
 	allBacklogsMu.Unlock()
 
 	setTestDir(t)
-	t.Logf("Using base dir %s", testDir)
+	t.Logf("Using base dir %s", testDirPath)
 
 	if !log.TestMode {
 		t.Logf("Enabling log test mode")
 		log.EnableTestingMode()
 	}
 
-	fDir := path.Join(testDir, "internal", "pkg", "dsiem", "siem", "fixtures")
+	fDir := path.Join(testDirPath, "internal", "pkg", "dsiem", "siem", "fixtures")
 	apm.Enable(true)
 
 	tmpLog := path.Join(os.TempDir(), "siem_alarm_events.log")
@@ -107,9 +131,9 @@ func TestBacklogMgr(t *testing.T) {
 	ch2 := make(chan event.NormalizedEvent)
 
 	// blogs.DRWMutex = drwmutex.New()
-	blogs.id = 1
+	blogs.Id = 1
 	blogs.bpCh = make(chan bool)
-	blogs.bl = make(map[string]*backLog) // have to do it here before the append
+	blogs.blogs = make(map[string]*backLog) // have to do it here before the append
 	allBacklogs = append(allBacklogs, &blogs)
 	bpChOutput := make(chan bool)
 	go func() {
@@ -123,7 +147,8 @@ func TestBacklogMgr(t *testing.T) {
 	go allBacklogs[0].manager(dirs.Dirs[1], ch2, 0)
 
 	holdSecDuration := 4
-	if err = InitBackLogManager(tmpLog, bpChOutput, holdSecDuration); err != nil {
+
+	if err = InitBackLogManager(tmpLog, bpChOutput, nil, holdSecDuration); err != nil {
 		t.Fatal(err)
 	}
 
@@ -171,7 +196,7 @@ func TestBacklogMgr(t *testing.T) {
 	e.DstIP = "192.168.0.3"
 	verifyEventOutput(t, e, ch, "Creating new backlog")
 
-	if len(allBacklogs[0].bl) != 2 {
+	if len(allBacklogs[0].blogs) != 2 {
 		t.Fatal("allBacklogs.bl is expected to have a length of 2")
 	} else {
 		t.Log("backlogs total event = 2 as expected.")
@@ -234,20 +259,20 @@ func TestBacklogMgr(t *testing.T) {
 	}
 
 	var blID string
-	for k := range allBacklogs[0].bl {
+	for k := range allBacklogs[0].blogs {
 		blID = k
 		break
 	}
 
 	fmt.Print("Deleting the 1st backlog: ", blID, " ..")
 	verifyFuncOutput(t, func() {
-		blogs.delete(allBacklogs[0].bl[blID])
+		blogs.delete(allBacklogs[0].blogs[blID])
 		time.Sleep(time.Second * 2)
 	}, "backlog manager setting status to deleted", true)
 
 	fmt.Print("Deleting it again ..")
 	verifyFuncOutput(t, func() {
-		blogs.delete(allBacklogs[0].bl[blID])
+		blogs.delete(allBacklogs[0].blogs[blID])
 		time.Sleep(time.Millisecond * 1)
 	}, "backlog is already in the process of being deleted", true)
 
@@ -272,27 +297,99 @@ func TestBacklogMgr(t *testing.T) {
 	}, "simulated server received backpressure data: true", true)
 }
 
-func verifyEventOutput(t *testing.T, e event.NormalizedEvent, ch chan event.NormalizedEvent, expected string) {
-	out := log.CaptureZapOutput(func() {
-		ch <- e
-		time.Sleep(time.Second * 1)
-	})
-	t.Log("out: ", out)
-	if !strings.Contains(out, expected) {
-		t.Fatalf("Cannot find '%s' in output: %s", expected, out)
-	} else {
-		fmt.Println("OK")
-	}
-}
+func TestBacklogCache(t *testing.T) {
+	fmt.Println("Starting TestBacklogCache.")
 
-func verifyFuncOutput(t *testing.T, f func(), expected string, expectMatch bool) {
-	out := log.CaptureZapOutput(f)
-	t.Log("out: ", out)
-	if !strings.Contains(out, expected) == expectMatch {
-		t.Fatalf("Cannot find '%s' in output: %s", expected, out)
-	} else {
-		fmt.Println("OK")
+	setTestDir(t)
+	t.Logf("Using base dir %s", testDirPath)
+
+	if !log.TestMode {
+		t.Logf("Enabling log test mode")
+		log.EnableTestingMode()
 	}
+
+	workspaceDirPath := path.Join(testDirPath, "internal", "pkg", "dsiem", "siem", "fixtures")
+	apm.Enable(true)
+
+	tmpLogPath := path.Join(os.TempDir(), "siem_alarm_events.log")
+	fWriter.Init(tmpLogPath, 10)
+
+	defer func() {
+		_ = os.Remove(tmpLogPath)
+	}()
+
+	initAlarm(t)
+	initAsset(t)
+
+	directivesDirPath := path.Join(workspaceDirPath, "directive5")
+	fmt.Println("Using directive directory ", directivesDirPath)
+	dirs, _, err := LoadDirectivesFromFile(directivesDirPath, directiveFileGlob, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(dirs.Dirs) != 1 {
+		t.Fatalf("expected only 1 directive to be loaded, but got %d", len(dirs.Dirs))
+	}
+
+	testDirective := dirs.Dirs[0]
+
+	blogs := &backlogs{
+		mut:   sync.RWMutex{},
+		Id:    5,
+		bpCh:  make(chan bool),
+		blogs: make(map[string]*backLog),
+	}
+
+	interruptChannel := make(chan os.Signal, 1)
+	signal.Notify(interruptChannel, os.Interrupt)
+
+	if err = InitBackLogManager(tmpLogPath, nil, interruptChannel, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	testEvent := event.NormalizedEvent{
+		EventID:   "1",
+		ConnID:    1,
+		Sensor:    "test-sensor",
+		SrcIP:     "1.1.1.1",
+		DstIP:     "2.2.2.2",
+		Title:     "Test Backlog Cache Event",
+		Protocol:  "TEST",
+		PluginID:  1337,
+		PluginSID: 1,
+		Timestamp: time.Now().Add(time.Second * -300).UTC().Format(time.RFC3339),
+	}
+
+	input := make(chan event.NormalizedEvent)
+	go blogs.manager(testDirective, input, 0)
+
+	fmt.Print("Writing backlog to cache ..")
+	verifyFuncOutput(t, func() {
+
+		input <- testEvent
+		interruptChannel <- os.Interrupt
+		time.Sleep(time.Second * 5)
+	}, "Backlogs written to disk", true)
+
+	go blogs.manager(testDirective, input, 0)
+
+	fmt.Print("Loading backlog from cache ..")
+	verifyFuncOutput(t, func() {
+		time.Sleep(time.Second * 5)
+	}, "Backlog cache found", true)
+
+	testEvent.Title = "Test Backlog Cache Resume"
+	fmt.Printf("Resumed backlogs can process event ..")
+	verifyEventOutput(t, testEvent, input, "backlog incoming event on idx")
+
+	// fmt.Printf("Resumed backlogs can reach max stage ..")
+	// verifyFuncOutput(t, func() {
+	// 	for i := 3; i < 101; i++ {
+	// 		input <- testEvent
+	// 	}
+	// 	time.Sleep(time.Second * 10)
+	// }, "reached max stage", true)
 }
 
 func TestBacklogManagerCustomData(t *testing.T) {
@@ -303,13 +400,13 @@ func TestBacklogManagerCustomData(t *testing.T) {
 	allBacklogsMu.Unlock()
 	setTestDir(t)
 
-	t.Logf("Using base dir %s", testDir)
+	t.Logf("Using base dir %s", testDirPath)
 	if !log.TestMode {
 		t.Logf("Enabling log test mode")
 		log.EnableTestingMode()
 	}
 
-	fDir := path.Join(testDir, "internal", "pkg", "dsiem", "siem", "fixtures")
+	fDir := path.Join(testDirPath, "internal", "pkg", "dsiem", "siem", "fixtures")
 	apm.Enable(true)
 
 	tmpLog := path.Join(os.TempDir(), "siem_alarm_events.log")
@@ -334,13 +431,13 @@ func TestBacklogManagerCustomData(t *testing.T) {
 
 	blogs := &backlogs{
 		// DRWMutex: drwmutex.New(),
-		mut:  sync.RWMutex{},
-		id:   1,
-		bpCh: make(chan bool),
-		bl:   make(map[string]*backLog),
+		mut:   sync.RWMutex{},
+		Id:    1,
+		bpCh:  make(chan bool),
+		blogs: make(map[string]*backLog),
 	}
 
-	if err = InitBackLogManager(tmpLog, nil, 4); err != nil {
+	if err = InitBackLogManager(tmpLog, nil, nil, 4); err != nil {
 		t.Fatal(err)
 	}
 
@@ -369,12 +466,12 @@ func TestBacklogManagerCustomData(t *testing.T) {
 
 	var testBl *backLog
 	blogs.mut.Lock()
-	if len(blogs.bl) != 1 {
-		t.Fatalf("expected 1 backlog, but got %d", len(blogs.bl))
+	if len(blogs.blogs) != 1 {
+		t.Fatalf("expected 1 backlog, but got %d", len(blogs.blogs))
 		blogs.mut.Unlock()
 	}
 
-	for _, v := range blogs.bl {
+	for _, v := range blogs.blogs {
 		testBl = v
 		break
 	}
@@ -441,13 +538,13 @@ func TestBacklogManagerCustomData(t *testing.T) {
 	// expected 2 backlogs now
 	var testBl2 *backLog
 	blogs.mut.Lock()
-	if len(blogs.bl) != 2 {
+	if len(blogs.blogs) != 2 {
 		blogs.mut.Unlock()
-		t.Fatalf("expected 2 backlog, but got %d", len(blogs.bl))
+		t.Fatalf("expected 2 backlog, but got %d", len(blogs.blogs))
 
 	}
 
-	for _, v := range blogs.bl {
+	for _, v := range blogs.blogs {
 		if testBl == v {
 			continue
 		}
@@ -510,12 +607,12 @@ func TestBacklogManagerCustomData(t *testing.T) {
 
 	var testBl3 *backLog
 	blogs.mut.Lock()
-	if len(blogs.bl) != 3 {
+	if len(blogs.blogs) != 3 {
 		blogs.mut.Unlock()
-		t.Fatalf("expected 3 backlog, but got %d", len(blogs.bl))
+		t.Fatalf("expected 3 backlog, but got %d", len(blogs.blogs))
 	}
 
-	for _, blog := range blogs.bl {
+	for _, blog := range blogs.blogs {
 		if testBl == blog || testBl2 == blog {
 			continue
 		}

@@ -17,8 +17,12 @@
 package siem
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
 	"strconv"
-	"sync/atomic"
 
 	"github.com/defenxor/dsiem/internal/pkg/dsiem/alarm"
 	"github.com/defenxor/dsiem/internal/pkg/dsiem/event"
@@ -35,18 +39,20 @@ import (
 
 type backlogs struct {
 	// drwmutex.DRWMutex
-	mut  sync.RWMutex
-	id   int
-	bl   map[string]*backLog
-	bpCh chan bool
+	mut           sync.RWMutex
+	Id            int `json:"id"`
+	blogs         map[string]*backLog
+	SavedBacklogs map[string]backLog `json:"backlogs"`
+	bpCh          chan bool
 }
 
 var (
 	// protects allBacklogs
-	allBacklogsMu sync.RWMutex
-
-	allBacklogs []*backlogs
-	fWriter     fs.FileWriter
+	allBacklogsMu    sync.RWMutex
+	backlogDir       string
+	allBacklogs      []*backlogs
+	fWriter          fs.FileWriter
+	interruptChannel chan os.Signal
 )
 
 const (
@@ -54,10 +60,19 @@ const (
 )
 
 // InitBackLogManager initialize backlog and ticker
-func InitBackLogManager(logFile string, bpChan chan<- bool, holdDuration int) (err error) {
+func InitBackLogManager(logFile string, bpChan chan<- bool, intChan chan os.Signal, holdDuration int) (err error) {
+	logDir := filepath.Dir(logFile)
+	backlogDir = path.Join(logDir, "backlogs")
+	interruptChannel = intChan
+
+	if _, err := os.Stat(backlogDir); os.IsNotExist(err) {
+		// Todo: log creation of backlog dir
+		if err = os.Mkdir(backlogDir, 0600); err != nil {
+			return err
+		}
+	}
 
 	err = fWriter.Init(logFile, maxFileQueueLength)
-
 	go func() { bpChan <- false }() // set initial state
 	go initBpTicker(bpChan, holdDuration)
 	return
@@ -131,7 +146,7 @@ func CountBackLogs() (sum int, activeDirectives int, ttlDirectives int) {
 	ttlDirectives = len(allBacklogs)
 	for i := range allBacklogs {
 		allBacklogs[i].mut.RLock()
-		nBlogs := len(allBacklogs[i].bl)
+		nBlogs := len(allBacklogs[i].blogs)
 		sum += nBlogs
 		if nBlogs > 0 {
 			activeDirectives++
@@ -154,27 +169,86 @@ func (blogs *backlogs) manager(d Directive, ch <-chan event.NormalizedEvent, min
 		isTaxoRule = true
 	}
 
+	// Load cached backlog into memory and resume its processing.
+	// Todo: load backlog only if a given option is specified
+	blogs.mut.Lock()
+	backlogStoragePath := path.Join(backlogDir, strconv.Itoa(d.ID))
+	{
+		if fbyte, err := os.ReadFile(backlogStoragePath); err == nil {
+			log.Info(log.M{Msg: fmt.Sprintf("Backlog cache found %s", backlogStoragePath), DId: d.ID})
+
+			var cachedBacklogs backlogs
+
+			if err := json.Unmarshal(fbyte, &cachedBacklogs); err == nil {
+				// Todo: handle if failed to remove cached file
+				os.Remove(backlogStoragePath)
+
+				for id, _ := range cachedBacklogs.SavedBacklogs {
+					backlog := backLog{}
+					backlog.ID = cachedBacklogs.SavedBacklogs[id].ID
+					backlog.StatusTime = cachedBacklogs.SavedBacklogs[id].StatusTime
+					backlog.Risk = cachedBacklogs.SavedBacklogs[id].Risk
+					backlog.CurrentStage = cachedBacklogs.SavedBacklogs[id].CurrentStage
+					backlog.HighestStage = cachedBacklogs.SavedBacklogs[id].HighestStage
+					backlog.Directive = cachedBacklogs.SavedBacklogs[id].Directive
+					backlog.SrcIPs = append(backlog.SrcIPs, cachedBacklogs.SavedBacklogs[id].SrcIPs...)
+					backlog.DstIPs = append(backlog.DstIPs, cachedBacklogs.SavedBacklogs[id].DstIPs...)
+					backlog.CustomData = append(backlog.CustomData, cachedBacklogs.SavedBacklogs[id].CustomData...)
+					backlog.bLogs = blogs
+					backlog.chData = make(chan event.NormalizedEvent)
+					backlog.chFound = make(chan bool)
+					backlog.chDone = make(chan struct{}, 1)
+					blogs.blogs[backlog.ID] = &backlog
+					log.Info(log.M{Msg: fmt.Sprintf("Backlog resumed [%s]", backlog.ID), DId: d.ID})
+					backlog.resume(minAlarmLifetime)
+				}
+			}
+		}
+	}
+	blogs.mut.Unlock()
+
 mainLoop:
 	for {
-		evt := <-ch
+		var incomingEvent event.NormalizedEvent
+
+		select {
+		case <-interruptChannel:
+			// Todo: write backlogs to disk
+			blogs.mut.Lock()
+			blogs.SavedBacklogs = make(map[string]backLog, len(blogs.blogs))
+
+			for id, backlog := range blogs.blogs {
+				blogs.SavedBacklogs[id] = backlog.DuplicateRawData()
+			}
+
+			if backlogsJsonByte, err := json.Marshal(blogs); err == nil {
+				log.Info(log.M{Msg: fmt.Sprintf("Backlogs written to disk [%d]", d.ID), DId: d.ID})
+				_ = os.WriteFile(backlogStoragePath, backlogsJsonByte, 0600)
+				// Todo: handle if unabled to write backlog to cache
+			}
+			blogs.mut.Unlock()
+
+			break mainLoop
+		case incomingEvent = <-ch:
+		}
 
 		var tx *apm.Transaction
 		if apm.Enabled() {
 			th := apm.TraceHeader{
-				Traceparent: evt.TraceParent,
-				TraceState:  evt.TraceState,
+				Traceparent: incomingEvent.TraceParent,
+				TraceState:  incomingEvent.TraceState,
 			}
 			tx = apm.StartTransaction("Directive Evaluation", "Event Correlation", nil, &th)
-			tx.SetCustom("event_id", evt.EventID)
+			tx.SetCustom("event_id", incomingEvent.EventID)
 			tx.SetCustom("directive_id", strconv.Itoa(d.ID))
 			// make this parent of downstream transactions
 			thisTh := tx.GetTraceContext()
-			evt.TraceParent = thisTh.Traceparent
-			evt.TraceState = thisTh.TraceState
+			incomingEvent.TraceParent = thisTh.Traceparent
+			incomingEvent.TraceState = thisTh.TraceState
 		}
 
 		if isPluginRule {
-			if rule.QuickCheckPluginRule(sidPairs, &evt) == false {
+			if !rule.QuickCheckPluginRule(sidPairs, &incomingEvent) {
 				if apm.Enabled() {
 					tx.Result("Event doesn't match directive plugin rules")
 					tx.End()
@@ -182,7 +256,7 @@ mainLoop:
 				continue mainLoop
 			}
 		} else if isTaxoRule {
-			if rule.QuickCheckTaxoRule(taxoPairs, &evt) == false {
+			if !rule.QuickCheckTaxoRule(taxoPairs, &incomingEvent) {
 				if apm.Enabled() {
 					tx.Result("Event doesn't match directive taxo rules")
 					tx.End()
@@ -191,48 +265,42 @@ mainLoop:
 			}
 		}
 
-		// found := false
-		// zero means false
-		var found uint32
+		var found bool
 		blogs.mut.RLock() // to prevent concurrent r/w with delete()
 
 		wg := &sync.WaitGroup{}
 
-		for k := range blogs.bl {
+		for k := range blogs.blogs {
 			wg.Add(1)
+
 			go func(k string) {
+				defer wg.Done()
 				// this first select is required, see #2 on https://go101.org/article/channel-closing.html
 				select {
 				// exit early if done, this should be the case while backlog in waiting for deletion mode
-				case <-blogs.bl[k].chDone:
-					wg.Done()
+				case <-blogs.blogs[k].chDone:
 					return
 				default:
 				}
+
 				select {
-				case <-blogs.bl[k].chDone: // exit early if done
-					wg.Done()
+				case <-blogs.blogs[k].chDone: // exit early if done
 					return
-				case blogs.bl[k].chData <- evt: // fwd to backlog
+				case blogs.blogs[k].chData <- incomingEvent: // fwd to backlog
 					select {
-					case <-blogs.bl[k].chDone: // exit early if done
-						wg.Done()
+					case <-blogs.blogs[k].chDone: // exit early if done
 						return
 					// wait for the result
-					case f := <-blogs.bl[k].chFound:
-						if f {
-							// found = true
-							atomic.AddUint32(&found, 1)
-						}
+					case f := <-blogs.blogs[k].chFound:
+						found = f || found
 					}
 				}
-				wg.Done()
 			}(k)
 		}
 		wg.Wait()
 		blogs.mut.RUnlock()
 
-		if found > 0 {
+		if found {
 			if apm.Enabled() && tx != nil {
 				tx.Result("Event consumed by backlog")
 				tx.End()
@@ -241,7 +309,7 @@ mainLoop:
 		}
 		// now for new backlog
 		// stickydiff cannot be used on 1st rule, so we pass nil
-		if !rule.DoesEventMatch(evt, d.Rules[0], nil, evt.ConnID) {
+		if !rule.DoesEventMatch(incomingEvent, d.Rules[0], nil, incomingEvent.ConnID) {
 			if apm.Enabled() && tx != nil {
 				tx.Result("Event doesn't match rule")
 				tx.End()
@@ -252,10 +320,10 @@ mainLoop:
 		// compare the event against all backlogs event ID to prevent duplicates
 		// due to concurrency
 		blogs.mut.Lock()
-		for _, v := range blogs.bl {
+		for _, v := range blogs.blogs {
 			for _, y := range v.Directive.Rules {
 				for _, j := range y.Events {
-					if j == evt.EventID {
+					if j == incomingEvent.EventID {
 						log.Info(log.M{Msg: "skipping backlog creation for event " + j +
 							", it's already used in backlog " + v.ID})
 						if apm.Enabled() && tx != nil {
@@ -272,9 +340,9 @@ mainLoop:
 
 		// lock from here also to prevent duplicates
 		blogs.mut.Lock()
-		b, err := createNewBackLog(d, evt)
+		b, err := createNewBackLog(d, incomingEvent)
 		if err != nil {
-			log.Warn(log.M{Msg: "Fail to create new backlog", DId: d.ID, CId: evt.ConnID})
+			log.Warn(log.M{Msg: "Fail to create new backlog", DId: d.ID, CId: incomingEvent.ConnID})
 			if apm.Enabled() && tx != nil {
 				tx.Result("Fail to create new backlog")
 				tx.End()
@@ -282,14 +350,14 @@ mainLoop:
 			blogs.mut.Unlock()
 			continue mainLoop
 		}
-		blogs.bl[b.ID] = b
-		blogs.bl[b.ID].bLogs = blogs
+		blogs.blogs[b.ID] = b
+		blogs.blogs[b.ID].bLogs = blogs
 		blogs.mut.Unlock()
 		if apm.Enabled() && tx != nil {
 			tx.Result("Event created a new backlog")
 			tx.End()
 		}
-		blogs.bl[b.ID].start(evt, minAlarmLifetime)
+		blogs.blogs[b.ID].start(incomingEvent, minAlarmLifetime)
 	}
 }
 
@@ -319,10 +387,10 @@ func (blogs *backlogs) delete(b *backLog) {
 		time.Sleep(3 * time.Second)
 		log.Debug(log.M{Msg: "backlog manager deleting backlog from map", DId: b.Directive.ID, BId: b.ID})
 		blogs.mut.Lock()
-		blogs.bl[b.ID].Lock()
-		blogs.bl[b.ID].bLogs = nil
-		blogs.bl[b.ID].Unlock()
-		delete(blogs.bl, b.ID)
+		blogs.blogs[b.ID].Lock()
+		blogs.blogs[b.ID].bLogs = nil
+		blogs.blogs[b.ID].Unlock()
+		delete(blogs.blogs, b.ID)
 		blogs.mut.Unlock()
 		ch := alarm.RemovalChannel()
 		ch <- b.ID
