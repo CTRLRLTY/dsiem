@@ -276,6 +276,12 @@ mainLoop:
 			go func(k string) {
 				defer wg.Done()
 				// this first select is required, see #2 on https://go101.org/article/channel-closing.html
+				// Note: Detail
+				// It is required because there can exist a race condition when both chDone and
+				// incomingEvent channel receive data at the same time, which would prompt the
+				// Go runtime to randomly select the blogs.blogs[k].chData <-incomingEvent branch to run.
+				// This can lead to a running backlog go routine to eventually calling close(chDone)
+				// even tho the chDone channel is already closed.
 				select {
 				// exit early if done, this should be the case while backlog in waiting for deletion mode
 				case <-blogs.blogs[k].chDone:
